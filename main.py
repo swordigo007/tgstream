@@ -1,128 +1,135 @@
 import os
-import time
-import uuid
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import logging
+import asyncio
+from datetime import datetime, timedelta
+from aiohttp import web
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 # ================= CONFIG =================
 
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BASE_URL = os.environ.get("BASE_URL")
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+BASE_URL = "http://YOUR_VPS_IP:8080"
+UPLOAD_DIR = "uploads"
 
-EXPIRE_TIME = 3600  # 1 hour
-CHUNK_SIZE = 1024 * 1024  # 1MB (increase speed)
+DEFAULT_ADMIN = 123456789  # 👈 Put your Telegram ID here
+admins = {DEFAULT_ADMIN}
 
-# ===========================================
+expiry_minutes = 60
+active_tasks = {}
 
-app = FastAPI()
-bot = Client("streambot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-TEMP_FILES = {}
+# ================= LOGGING =================
 
+logging.basicConfig(
+    filename="bot.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+)
 
-# ================= START BOT =================
+# ================= WEB SERVER =================
 
-@app.on_event("startup")
-async def startup():
-    await bot.start()
+async def handle_download(request):
+    filename = request.match_info['filename']
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    if os.path.exists(filepath):
+        return web.FileResponse(filepath)
+    return web.Response(text="File expired or not found", status=404)
 
+async def start_web():
+    app = web.Application()
+    app.router.add_get('/file/{filename}', handle_download)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
 
-@app.on_event("shutdown")
-async def shutdown():
-    await bot.stop()
+# ================= BOT HANDLERS =================
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Send me a file to generate Stream & Fast Download link.")
 
-# ================= STREAM ROUTE =================
+async def set_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global expiry_minutes
+    if update.effective_user.id not in admins:
+        return
+    expiry_minutes = int(context.args[0])
+    await update.message.reply_text(f"Expiry set to {expiry_minutes} minutes.")
 
-@app.get("/stream/{file_key}")
-async def stream(file_key: str, request: Request):
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in admins:
+        return
+    new_admin = int(context.args[0])
+    admins.add(new_admin)
+    await update.message.reply_text(f"Admin added: {new_admin}")
 
-    if file_key not in TEMP_FILES:
-        raise HTTPException(status_code=404, detail="Invalid or expired link")
+async def cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in admins:
+        return
+    user_id = int(context.args[0])
+    if user_id in active_tasks:
+        del active_tasks[user_id]
+        await update.message.reply_text(f"Cancelled task of {user_id}")
+    else:
+        await update.message.reply_text("No active task found.")
 
-    file_id, created = TEMP_FILES[file_key]
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    file = await update.message.document.get_file()
 
-    if time.time() - created > EXPIRE_TIME:
-        del TEMP_FILES[file_key]
-        raise HTTPException(status_code=403, detail="Link expired")
+    filename = f"{user.id}_{int(datetime.now().timestamp())}_{update.message.document.file_name}"
+    filepath = os.path.join(UPLOAD_DIR, filename)
 
-    msg = await bot.get_messages("me", file_id)
-    media = msg.document or msg.video
+    logging.info(f"{user.id} uploaded {filename}")
 
-    if not media:
-        raise HTTPException(status_code=404, detail="File not found")
+    await file.download_to_drive(filepath)
 
-    file_size = media.file_size
-    file_name = media.file_name or "video.mp4"
+    expire_time = datetime.now() + timedelta(minutes=expiry_minutes)
+    active_tasks[user.id] = filename
 
-    range_header = request.headers.get("range")
-    start = 0
-    end = file_size - 1
+    asyncio.create_task(auto_delete(filepath, expiry_minutes))
 
-    if range_header:
-        range_value = range_header.replace("bytes=", "")
-        start_str, end_str = range_value.split("-")
+    stream_link = f"{BASE_URL}/file/{filename}"
+    download_link = f"{BASE_URL}/file/{filename}"
 
-        start = int(start_str) if start_str else 0
-        end = int(end_str) if end_str else file_size - 1
-
-    length = end - start + 1
-
-    async def generator():
-        async for chunk in bot.stream_media(
-            media.file_id,
-            offset=start,
-            limit=length,
-            chunk_size=CHUNK_SIZE
-        ):
-            yield chunk
-
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(length),
-        "Content-Disposition": f'attachment; filename="{file_name}"'
-    }
-
-    if range_header:
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        return StreamingResponse(generator(), status_code=206, headers=headers)
-
-    return StreamingResponse(generator(), headers=headers)
-
-
-# ================= BOT HANDLER =================
-
-@bot.on_message(filters.document | filters.video)
-async def generate_link(client, message):
-
-    key = str(uuid.uuid4())
-    TEMP_FILES[key] = (message.id, time.time())
-
-    stream_link = f"{BASE_URL}/stream/{key}"
-    download_link = f"{BASE_URL}/stream/{key}"
-
-    buttons = InlineKeyboardMarkup(
+    keyboard = InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton("🎬 Stream", url=stream_link)
-            ],
-            [
-                InlineKeyboardButton("⚡ Fast Download", url=download_link)
-            ]
+            InlineKeyboardButton("🎬 Stream", url=stream_link),
+            InlineKeyboardButton("⚡ Fast Download", url=download_link)
         ]
+    ])
+
+    await update.message.reply_text(
+        f"✅ Links generated\n\n"
+        f"⏳ Expires in {expiry_minutes} minutes",
+        reply_markup=keyboard
     )
 
-    file = message.document or message.video
-    size_mb = round(file.file_size / (1024 * 1024), 2)
+async def auto_delete(filepath, minutes):
+    await asyncio.sleep(minutes * 60)
+    if os.path.exists(filepath):
+        os.remove(filepath)
 
-    await message.reply_text(
-        f"🚀 File Ready!\n\n"
-        f"📦 Size: {size_mb} MB\n"
-        f"⏳ Expires in: 1 Hour\n\n"
-        f"Choose an option below:",
-        reply_markup=buttons
-    )
+# ================= MAIN =================
+
+async def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("setexpiry", set_expiry))
+    app.add_handler(CommandHandler("addadmin", add_admin))
+    app.add_handler(CommandHandler("cancel", cancel_task))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
+    await start_web()
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
