@@ -14,7 +14,7 @@ app = FastAPI()
 bot = Client("streambot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 TEMP_FILES = {}
-EXPIRE_TIME = 3600
+EXPIRE_TIME = 86400
 
 
 @app.on_event("startup")
