@@ -14,12 +14,12 @@ BASE_URL = os.getenv("BASE_URL")
 
 # DB
 client = MongoClient(MONGO_URI)
-db = client["StreamBot"]
+db = client["cloudworld"]
 links = db.links
 settings = db.settings
 
 # TELEGRAM BOT
-bot = Client("streambot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+bot = Client("cloudworld", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
 # FLASK APP
 app = Flask(__name__)
