@@ -1,8 +1,2 @@
-fastapi
-uvicorn
-pyrogram
-tgcrypto
-uvloop
-httptools
 python-telegram-bot==20.7
 aiohttp
